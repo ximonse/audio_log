@@ -1,0 +1,5 @@
+"""Daylog package."""
+
+from .constants import PIPELINE_VERSION
+
+__all__ = ["PIPELINE_VERSION"]
