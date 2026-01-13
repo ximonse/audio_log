@@ -14,11 +14,18 @@ from daylog.config import DaylogConfig
 from daylog.constants import DEFAULT_TIMEZONE, SCHEMA_VERSION
 from daylog.io.ffmpeg import convert_to_wav, probe_duration
 from daylog.io.hash import sha256_file
+import time
 from daylog.io.paths import build_paths
 from daylog.io.recording import build_recording_metadata
 from daylog.io.serialize import write_csv, write_json, write_jsonl
 from daylog.pipeline.asr import TranscriptChunk, transcribe_segments
-from daylog.pipeline.merge import build_csv_rows, build_events
+from daylog.pipeline.merge import (
+    _timestamp_chunk_id,
+    build_csv_rows,
+    build_events,
+    export_audio_chunks,
+    merge_transcript_chunks,
+)
 from daylog.pipeline.vad import run_vad
 
 AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".flac", ".aac", ".ogg", ".opus"}
@@ -46,16 +53,36 @@ def _resolve_date(input_path: Path, override: Optional[str]) -> str:
 def _resolve_start_time(
     input_path: Path, start_time: Optional[str], use_mtime: bool
 ) -> tuple[Optional[datetime], str]:
+    # Priority 1: User-provided start_time
     if start_time:
         tz = ZoneInfo(DEFAULT_TIMEZONE)
         dt = datetime.fromisoformat(start_time)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=tz)
         return dt, "user_set"
+
+    # Priority 2: Parse from filename
+    from daylog.gui.date_parser import DateTimeParser
+    result = DateTimeParser.parse_filename(input_path.name)
+    if result:
+        dt, has_time = result
+        if has_time:
+            return dt, "filename"
+
+    # Priority 3: Parse from parent directory name (e.g., "1 sep. 2024 18-46-16 (5)")
+    if input_path.parent:
+        result = DateTimeParser.parse_filename(input_path.parent.name)
+        if result:
+            dt, has_time = result
+            if has_time:
+                return dt, "directory_name"
+
+    # Priority 4: Use file mtime if requested
     if use_mtime:
         tz = ZoneInfo(DEFAULT_TIMEZONE)
         dt = datetime.fromtimestamp(input_path.stat().st_mtime, tz)
         return dt, "file_mtime"
+
     return None, "unknown"
 
 
@@ -91,16 +118,29 @@ def process_recording(
         input_path, start_time=start_time, use_mtime=use_mtime
     )
 
-    logger.info("Converting audio")
+    # === PERFORMANCE TIMING ===
+    pipeline_start = time.time()
+    logger.info(f"=== PIPELINE START: {input_path.name} (duration: {duration_s:.1f}s) ===")
+
+    # Stage 1: Audio conversion
+    stage_start = time.time()
+    logger.info("Stage 1/5: Converting audio")
     convert_to_wav(
         paths.original_copy,
         paths.audio_wav,
         sample_rate=config.audio.sample_rate_hz,
         channels=config.audio.channels,
     )
+    stage_time = time.time() - stage_start
+    logger.info(f"✓ Audio conversion completed in {stage_time:.1f}s")
 
-    logger.info("Running VAD")
+    # Stage 2: VAD
+    stage_start = time.time()
+    logger.info("Stage 2/5: Running VAD (Energy + Spectral + Silero)")
     vad_segments = run_vad(paths.audio_wav, config.vad)
+    stage_time = time.time() - stage_start
+    total_speech_s = sum(seg.t1 - seg.t0 for seg in vad_segments)
+    logger.info(f"✓ VAD completed in {stage_time:.1f}s - Found {len(vad_segments)} segments ({total_speech_s:.1f}s speech)")
 
     segments_payload = {
         "schema_version": SCHEMA_VERSION,
@@ -109,10 +149,12 @@ def process_recording(
     }
     write_json(paths.segments_json, segments_payload)
 
+    # Stage 3: ASR (Transcription)
     transcript_chunks = []
     detected_language = None
     if vad_segments:
-        logger.info("Running ASR")
+        stage_start = time.time()
+        logger.info(f"Stage 3/5: Running ASR on {len(vad_segments)} segments ({total_speech_s:.1f}s speech)")
         try:
             transcript_chunks, detected_language = transcribe_segments(
                 paths.audio_wav,
@@ -122,8 +164,12 @@ def process_recording(
                 sample_rate=config.audio.sample_rate_hz,
                 channels=config.audio.channels,
             )
+            stage_time = time.time() - stage_start
+            throughput = total_speech_s / stage_time if stage_time > 0 else 0
+            logger.info(f"✓ ASR completed in {stage_time:.1f}s ({stage_time/60:.1f}min) - Throughput: {throughput:.2f}x realtime")
         except Exception as exc:
-            logger.error("ASR failed: %s", exc)
+            stage_time = time.time() - stage_start
+            logger.error(f"✗ ASR failed after {stage_time:.1f}s: %s", exc)
             transcript_chunks = [
                 TranscriptChunk(
                     t0=seg.t0,
@@ -135,13 +181,65 @@ def process_recording(
                 for seg in vad_segments
             ]
     else:
-        logger.info("No speech segments found; skipping ASR")
+        logger.info("Stage 3/5: No speech segments found; skipping ASR")
+
+    # Stage 4: Merge chunks
+    stage_start = time.time()
+    logger.info("Stage 4/5: Merging transcript chunks")
+    if transcript_chunks:
+        original_count = len(transcript_chunks)
+        transcript_chunks = merge_transcript_chunks(transcript_chunks, min_gap_s=15.0)
+        stage_time = time.time() - stage_start
+        logger.info(f"✓ Merged {original_count} chunks into {len(transcript_chunks)} blocks in {stage_time:.1f}s")
+
+        # Export audio chunks (matching CSV event_id)
+        logger.info(f"Exporting {len(transcript_chunks)} audio chunks...")
+        audio_chunks_dir = paths.processed_dir / "audio_chunks"
+        export_audio_chunks(
+            audio_wav=paths.audio_wav,
+            transcript_chunks=transcript_chunks,
+            start_time=start_dt,
+            output_dir=audio_chunks_dir,
+            sample_rate=config.audio.sample_rate_hz,
+            channels=config.audio.channels,
+        )
+        logger.info(f"✓ Audio chunks saved to {audio_chunks_dir}")
+    else:
+        stage_time = time.time() - stage_start
+        logger.info(f"✓ No chunks to merge ({stage_time:.1f}s)")
+
+    # Stage 5: Output files
+    stage_start = time.time()
+    logger.info("Stage 5/5: Writing output files")
+
+    # Build transcript chunks with chunk_id included
+    transcript_chunks_with_id = []
+    for chunk in transcript_chunks:
+        chunk_id = _timestamp_chunk_id(start_dt, chunk.t0)
+        chunk_dict = {
+            "chunk_id": chunk_id,
+            "t0": chunk.t0,
+            "t1": chunk.t1,
+            "text": chunk.text,
+            "asr_confidence": chunk.asr_confidence,
+            "error": chunk.error,
+        }
+        transcript_chunks_with_id.append(chunk_dict)
+
+    # Calculate recording end_time
+    from datetime import timedelta
+    end_dt = None
+    if start_dt:
+        end_dt = start_dt + timedelta(seconds=duration_s)
 
     transcript_payload = {
         "schema_version": SCHEMA_VERSION,
         "recording_id": str(recording_id),
         "language": detected_language,
-        "chunks": [chunk.__dict__ for chunk in transcript_chunks],
+        "start_time": start_dt.isoformat() if start_dt else None,
+        "end_time": end_dt.isoformat() if end_dt else None,
+        "duration_s": duration_s,
+        "chunks": transcript_chunks_with_id,
     }
     write_json(paths.transcript_json, transcript_payload)
 
@@ -149,7 +247,8 @@ def process_recording(
     for chunk in transcript_chunks:
         if not chunk.text:
             continue
-        transcript_lines.append(f"[{chunk.t0:.3f}-{chunk.t1:.3f}] {chunk.text}")
+        chunk_id = _timestamp_chunk_id(start_dt, chunk.t0)
+        transcript_lines.append(f"[{chunk_id}] {chunk.text}")
     paths.transcript_txt.write_text("\n".join(transcript_lines), encoding="utf-8")
 
     events = build_events(
@@ -174,10 +273,30 @@ def process_recording(
     )
     write_json(paths.recording_json, recording_payload)
 
+    stage_time = time.time() - stage_start
+    logger.info(f"✓ Output files written in {stage_time:.1f}s")
+
     if not config.output.keep_intermediate:
         chunk_dir = paths.processed_dir / "chunks"
         if chunk_dir.exists():
-            shutil.rmtree(chunk_dir)
+            try:
+                shutil.rmtree(chunk_dir)
+            except Exception as exc:
+                logger.warning(f"Could not remove chunks directory (not critical): {exc}")
+
+    # === PIPELINE SUMMARY ===
+    total_time = time.time() - pipeline_start
+    realtime_factor = duration_s / total_time if total_time > 0 else 0
+    logger.info("=" * 70)
+    logger.info(f"=== PIPELINE COMPLETE ===")
+    logger.info(f"Total time: {total_time:.1f}s ({total_time/60:.1f}min)")
+    logger.info(f"Audio duration: {duration_s:.1f}s ({duration_s/60:.1f}min)")
+    logger.info(f"Realtime factor: {realtime_factor:.2f}x ({100/realtime_factor:.1f}% realtime)")
+    logger.info(f"VAD segments: {len(vad_segments)} ({total_speech_s:.1f}s speech)")
+    logger.info(f"Transcript blocks: {len(transcript_chunks)}")
+    logger.info(f"Language detected: {detected_language or 'unknown'}")
+    logger.info(f"Output: {paths.recording_dir}")
+    logger.info("=" * 70)
 
     return paths.recording_dir
 

@@ -1,17 +1,14 @@
 [vad]
-mode = 2
-frame_ms = 30
-padding_pre_s = 0.3
-padding_post_s = 0.3
-merge_gap_s = 0.6
-min_speech_s = 0.4
+# Silero VAD settings
+threshold = 0.5  # Speech probability (0-1). Higher = stricter
+min_speech_s = 0.25  # Minimum speech segment length
+min_silence_s = 2.0  # Minimum silence to split segments (increased for better chunking)
+padding_pre_s = 0.0  # Padding before segments
 
 [asr]
-model = "base"
-language = null
+model = "small"  # Options: tiny, base, small, medium, large (small is best for Swedish)
+language = "sv"  # Force Swedish transcription
 word_timestamps = false
-beam_size = 5
-vad_filter = false
 
 [diarize]
 enabled = false

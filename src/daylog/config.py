@@ -14,12 +14,10 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
 
 @dataclass(frozen=True)
 class VadConfig:
-    mode: int = 2
-    frame_ms: int = 30
-    padding_pre_s: float = 0.3
-    padding_post_s: float = 0.3
-    merge_gap_s: float = 0.6
-    min_speech_s: float = 0.4
+    threshold: float = 0.5  # Speech probability threshold (0-1)
+    min_speech_s: float = 0.25  # Minimum speech duration in seconds
+    min_silence_s: float = 0.1  # Minimum silence duration to split segments
+    padding_pre_s: float = 0.0  # Padding before each segment
 
 
 @dataclass(frozen=True)
@@ -27,8 +25,6 @@ class AsrConfig:
     model: str = "base"
     language: Optional[str] = None
     word_timestamps: bool = False
-    beam_size: int = 5
-    vad_filter: bool = False
 
 
 @dataclass(frozen=True)

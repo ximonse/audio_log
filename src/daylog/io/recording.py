@@ -22,8 +22,16 @@ def build_recording_metadata(
     file_hash: str,
     config: DaylogConfig,
 ) -> Dict[str, Any]:
+    from datetime import timedelta
+
     stat = input_path.stat()
     mtime = datetime.fromtimestamp(stat.st_mtime, tz=ZoneInfo(DEFAULT_TIMEZONE))
+
+    # Calculate end_time if start_time is available
+    end_time = None
+    if start_time:
+        end_time = start_time + timedelta(seconds=duration_s)
+
     return {
         "schema_version": SCHEMA_VERSION,
         "pipeline_version": PIPELINE_VERSION,
@@ -37,13 +45,14 @@ def build_recording_metadata(
             "duration_s": duration_s,
         },
         "start_time": start_time.isoformat() if start_time else None,
+        "end_time": end_time.isoformat() if end_time else None,
         "start_time_source": start_time_source,
         "tool_versions": {
             "python": python_version(),
             "ffmpeg": ffmpeg_version(),
             "ffprobe": ffprobe_version(),
             "webrtcvad": package_version("webrtcvad"),
-            "faster_whisper": package_version("faster-whisper"),
+            "openai_whisper": package_version("openai-whisper"),
         },
         "config": {
             "vad": config.vad.__dict__,

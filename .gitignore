@@ -1,10 +1,19 @@
 __pycache__/
 *.pyc
 .venv/
+venv*/
 .env/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
 Recordings/
-.git2/
 .claude/
+
+# Test logs
+test_*.log
+gui_test.log
+
+# Build artifacts
+*.egg-info/
+dist/
+build/

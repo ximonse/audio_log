@@ -11,13 +11,20 @@ requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [{name = "Daylog Team"}]
 dependencies = [
-  "webrtcvad>=2.0.10",
-  "faster-whisper>=0.10.0",
+  "torch>=2.0.0",
+  "torchaudio>=2.0.0",
+  "faster-whisper>=1.0.0",
   "tzdata>=2024.1",
+]
+
+[project.optional-dependencies]
+gui = [
+  "tkinterdnd2>=0.3.0",
 ]
 
 [project.scripts]
 daylog = "daylog.cli:main"
+daylog-gui = "daylog.gui:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

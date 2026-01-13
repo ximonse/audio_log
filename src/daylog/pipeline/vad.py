@@ -1,15 +1,19 @@
-"""Voice activity detection using WebRTC VAD."""
+"""Voice activity detection with energy and spectral pre-filtering."""
 
 from __future__ import annotations
 
+import logging
 import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
 
-import webrtcvad
+import numpy as np
+import torch
 
 from daylog.config import VadConfig
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -19,72 +23,228 @@ class VadSegment:
     vad_confidence: float
 
 
-def _initial_segments(speech_flags: List[bool]) -> List[Tuple[int, int]]:
-    segments = []
+def _read_wav_data(wav_path: Path) -> Tuple[np.ndarray, int]:
+    """Read WAV file and return audio data + sample rate."""
+    with wave.open(str(wav_path), "rb") as wf:
+        sample_rate = wf.getframerate()
+        n_frames = wf.getnframes()
+        audio_bytes = wf.readframes(n_frames)
+        audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    return audio, sample_rate
+
+
+def _energy_gate(audio: np.ndarray, sample_rate: int, block_s: float = 1.0, db_threshold: float = -50.0) -> List[Tuple[int, int]]:
+    """
+    Stage 1: Energy-based filtering.
+
+    Find blocks with audio above energy threshold (removes silence).
+
+    Args:
+        audio: Audio samples
+        sample_rate: Sample rate in Hz
+        block_s: Block size in seconds
+        db_threshold: Energy threshold in dB (e.g., -50 dB)
+
+    Returns:
+        List of (start_sample, end_sample) regions with energy above threshold
+    """
+    logger.info(f"Stage 1: Energy gate (threshold={db_threshold} dB)")
+
+    block_samples = int(block_s * sample_rate)
+    n_blocks = len(audio) // block_samples
+
+    regions = []
     start = None
-    for idx, is_speech in enumerate(speech_flags):
-        if is_speech and start is None:
-            start = idx
-        elif not is_speech and start is not None:
-            segments.append((start, idx))
-            start = None
-    if start is not None:
-        segments.append((start, len(speech_flags)))
-    return segments
 
+    for i in range(n_blocks):
+        block = audio[i * block_samples:(i + 1) * block_samples]
 
-def _apply_padding(segments: List[Tuple[int, int]], frame_s: float, config: VadConfig) -> List[Tuple[float, float]]:
-    padded = []
-    for start, end in segments:
-        t0 = max(0.0, start * frame_s - config.padding_pre_s)
-        t1 = end * frame_s + config.padding_post_s
-        padded.append((t0, t1))
-    return padded
+        # Calculate RMS energy in dB
+        rms = np.sqrt(np.mean(block ** 2))
+        db = 20 * np.log10(rms + 1e-10)  # Add epsilon to avoid log(0)
 
-
-def _merge_segments(segments: List[Tuple[float, float]], merge_gap_s: float) -> List[Tuple[float, float]]:
-    if not segments:
-        return []
-    segments = sorted(segments, key=lambda seg: seg[0])
-    merged = [list(segments[0])]
-    for t0, t1 in segments[1:]:
-        if t0 - merged[-1][1] <= merge_gap_s:
-            merged[-1][1] = max(merged[-1][1], t1)
+        if db > db_threshold:
+            if start is None:
+                start = i * block_samples
         else:
-            merged.append([t0, t1])
-    return [(float(t0), float(t1)) for t0, t1 in merged]
+            if start is not None:
+                regions.append((start, i * block_samples))
+                start = None
+
+    # Handle final region
+    if start is not None:
+        regions.append((start, n_blocks * block_samples))
+
+    total_s = sum(end - start for start, end in regions) / sample_rate
+    logger.info(f"Energy gate kept {len(regions)} regions ({total_s:.1f}s / {len(audio)/sample_rate:.1f}s)")
+
+    return regions
+
+
+def _spectral_filter(audio: np.ndarray, sample_rate: int, regions: List[Tuple[int, int]], window_s: float = 0.5) -> List[Tuple[int, int]]:
+    """
+    Stage 2: Spectral filtering.
+
+    Analyze frequency content to filter speech-like audio.
+    Speech has energy in 300-3400 Hz (telephony band).
+
+    Args:
+        audio: Audio samples
+        sample_rate: Sample rate in Hz
+        regions: Regions from energy gate
+        window_s: Window size for spectral analysis
+
+    Returns:
+        List of (start_sample, end_sample) regions likely containing speech
+    """
+    logger.info("Stage 2: Spectral filtering (300-3400 Hz band)")
+
+    window_samples = int(window_s * sample_rate)
+    speech_regions = []
+
+    for start, end in regions:
+        region_audio = audio[start:end]
+        n_windows = len(region_audio) // window_samples
+
+        speech_start = None
+
+        for i in range(n_windows):
+            window = region_audio[i * window_samples:(i + 1) * window_samples]
+
+            # FFT to get frequency content
+            fft = np.fft.rfft(window)
+            freqs = np.fft.rfftfreq(len(window), 1 / sample_rate)
+            magnitude = np.abs(fft)
+
+            # Calculate energy in speech band (300-3400 Hz)
+            speech_band = (freqs >= 300) & (freqs <= 3400)
+            speech_energy = np.sum(magnitude[speech_band])
+
+            # Calculate energy in low-freq noise band (20-200 Hz)
+            noise_band = (freqs >= 20) & (freqs <= 200)
+            noise_energy = np.sum(magnitude[noise_band])
+
+            # Calculate energy in high-freq band (above 3400 Hz)
+            high_band = freqs > 3400
+            high_energy = np.sum(magnitude[high_band])
+
+            # Speech detection: high energy in speech band, low in noise band
+            total_energy = speech_energy + noise_energy + high_energy + 1e-10
+            speech_ratio = speech_energy / total_energy
+
+            # Threshold: at least 40% of energy in speech band
+            is_speech_like = speech_ratio > 0.4
+
+            if is_speech_like:
+                if speech_start is None:
+                    speech_start = start + i * window_samples
+            else:
+                if speech_start is not None:
+                    speech_regions.append((speech_start, start + i * window_samples))
+                    speech_start = None
+
+        # Handle final region
+        if speech_start is not None:
+            speech_regions.append((speech_start, end))
+
+    total_s = sum(end - start for start, end in speech_regions) / sample_rate
+    logger.info(f"Spectral filter kept {len(speech_regions)} regions ({total_s:.1f}s)")
+
+    return speech_regions
+
+
+def _merge_close_regions(regions: List[Tuple[int, int]], sample_rate: int, gap_s: float = 0.5) -> List[Tuple[int, int]]:
+    """Merge regions that are close together."""
+    if not regions:
+        return []
+
+    gap_samples = int(gap_s * sample_rate)
+    merged = [list(regions[0])]
+
+    for start, end in regions[1:]:
+        if start - merged[-1][1] <= gap_samples:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
+    return [(s, e) for s, e in merged]
 
 
 def run_vad(wav_path: Path, config: VadConfig) -> List[VadSegment]:
-    if config.frame_ms not in (10, 20, 30):
-        raise ValueError("frame_ms must be 10, 20, or 30 for WebRTC VAD")
-    frame_s = config.frame_ms / 1000.0
-    vad = webrtcvad.Vad(config.mode)
-    speech_flags = []
-    with wave.open(str(wav_path), "rb") as wf:
-        num_channels = wf.getnchannels()
-        sample_width = wf.getsampwidth()
-        sample_rate = wf.getframerate()
-        if num_channels != 1:
-            raise ValueError("VAD requires mono audio")
-        if sample_width != 2:
-            raise ValueError("VAD requires 16-bit PCM")
-        frame_samples = int(sample_rate * frame_s)
-        while True:
-            frame = wf.readframes(frame_samples)
-            if len(frame) < frame_samples * sample_width:
-                break
-            speech_flags.append(vad.is_speech(frame, sample_rate))
-    initial = _initial_segments(speech_flags)
-    padded = _apply_padding(initial, frame_s, config)
-    merged = _merge_segments(padded, config.merge_gap_s)
-    segments = []
-    for t0, t1 in merged:
-        if t1 - t0 < config.min_speech_s:
-            continue
-        segments.append(VadSegment(t0=t0, t1=t1, vad_confidence=1.0))
-    return segments
+    """
+    Run VAD with two-stage pre-filtering optimized for long recordings.
 
+    Stage 1: Energy gate - removes silence
+    Stage 2: Spectral filter - removes non-speech audio
+    Stage 3: Silero VAD - precise speech detection on candidates
 
-def merge_segments(segments: List[Tuple[float, float]], merge_gap_s: float) -> List[Tuple[float, float]]:
-    return _merge_segments(segments, merge_gap_s)
+    Args:
+        wav_path: Path to mono 16-bit WAV file
+        config: VAD configuration
+
+    Returns:
+        List of speech segments with timestamps in seconds
+    """
+    logger.info(f"Running VAD on {wav_path}")
+
+    # Read audio
+    audio, sample_rate = _read_wav_data(wav_path)
+    duration_s = len(audio) / sample_rate
+    logger.info(f"Audio duration: {duration_s:.1f}s ({duration_s/3600:.1f}h)")
+
+    # Stage 1: Energy gate
+    energy_regions = _energy_gate(audio, sample_rate, block_s=1.0, db_threshold=-50.0)
+
+    if not energy_regions:
+        logger.info("No audio above energy threshold")
+        return []
+
+    # Stage 2: Spectral filtering
+    speech_regions = _spectral_filter(audio, sample_rate, energy_regions, window_s=0.5)
+
+    if not speech_regions:
+        logger.info("No speech-like audio found")
+        return []
+
+    # Merge close regions before Silero VAD
+    speech_regions = _merge_close_regions(speech_regions, sample_rate, gap_s=0.5)
+
+    # Stage 3: Silero VAD on speech candidates
+    logger.info("Stage 3: Silero VAD on speech candidates")
+    model, utils = torch.hub.load(
+        repo_or_dir="snakers4/silero-vad",
+        model="silero_vad",
+        force_reload=False,
+        onnx=False,
+    )
+    (get_speech_timestamps, _, _, _, _) = utils
+
+    all_segments = []
+
+    for region_start, region_end in speech_regions:
+        # Extract region audio
+        region_audio = audio[region_start:region_end]
+        region_tensor = torch.from_numpy(region_audio)
+
+        # Run Silero VAD
+        speech_timestamps = get_speech_timestamps(
+            region_tensor,
+            model,
+            sampling_rate=sample_rate,
+            threshold=config.threshold,
+            min_speech_duration_ms=int(config.min_speech_s * 1000),
+            min_silence_duration_ms=int(config.min_silence_s * 1000),
+            window_size_samples=512,
+            speech_pad_ms=int(config.padding_pre_s * 1000),
+        )
+
+        # Convert to absolute timestamps
+        for ts in speech_timestamps:
+            abs_start = (region_start + ts["start"]) / sample_rate
+            abs_end = (region_start + ts["end"]) / sample_rate
+            all_segments.append(VadSegment(t0=abs_start, t1=abs_end, vad_confidence=1.0))
+
+    total_speech_s = sum(seg.t1 - seg.t0 for seg in all_segments)
+    logger.info(f"Found {len(all_segments)} speech segments ({total_speech_s:.1f}s total)")
+
+    return all_segments
