@@ -133,66 +133,26 @@ class BatchProcessor:
         """
         self._current_item_id = item.id
 
-        # Progress monitor control
-        import threading
-        done = {"value": False}
-
         try:
-            # Stage 1: Preparing (0-5%)
-            self._update_progress(item.id, queue, 0.02, "Preparing...")
-            time.sleep(0.1)
-
-            # Stage 2: Converting audio (5-20%)
-            self._update_progress(item.id, queue, 0.05, "Converting audio...")
-
-            # Run pipeline with progress monitoring in separate thread
-            progress = {"value": 0.05, "message": "Converting audio..."}
-
-            def update_progress_loop():
-                # Simple stage-based progress that doesn't get stuck
-                stages = [
-                    (0.10, "Converting audio..."),
-                    (0.20, "Stage 1/5: Audio conversion"),
-                    (0.30, "Stage 2/5: VAD processing"),
-                    (0.40, "Stage 2/5: VAD - Energy filter"),
-                    (0.50, "Stage 2/5: VAD - Spectral analysis"),
-                    (0.60, "Stage 2/5: VAD - Silero"),
-                    (0.70, "Stage 3/5: Transcription"),
-                    (0.80, "Stage 3/5: Transcribing (check terminal for details)"),
-                    (0.85, "Stage 4/5: Merging chunks"),
-                    (0.90, "Stage 5/5: Writing outputs"),
-                ]
-                stage_idx = 0
-                while not done["value"]:
-                    time.sleep(3.0)  # Update every 3 seconds
-                    if not done["value"] and stage_idx < len(stages):
-                        prog, msg = stages[stage_idx]
-                        progress["value"] = prog
-                        progress["message"] = msg
-                        self._update_progress(item.id, queue, prog, msg)
-                        stage_idx += 1
-                    # After all stages, stay at 90% showing terminal message
-
-            monitor_thread = threading.Thread(target=update_progress_loop, daemon=True)
-            monitor_thread.start()
-
+            # Initial status
+            self._update_progress(item.id, queue, 0.01, "Initializing...")
             logging.info(f"Processing {item.filename}")
+
+            # Callback for pipeline
+            def pipeline_progress(stage: str, progress: float):
+                # Throttle updates if needed, but for now direct transparency is good
+                # Ensure we don't block the pipeline, so keep it lightweight.
+                # _update_progress just puts things in queue/callback, which is fast.
+                self._update_progress(item.id, queue, progress, stage)
+
             outputs = run_pipeline(
                 input_path=item.path,
                 config=self.config,
                 date_override=item.date if not item.use_mtime else None,
                 start_time=item.start_time,
                 use_mtime=item.use_mtime,
+                progress_callback=pipeline_progress,
             )
-
-            done["value"] = True
-            monitor_thread.join(timeout=0.5)
-
-            # Stage 5: Saving (90-100%)
-            self._update_progress(item.id, queue, 0.92, "Saving outputs...")
-            time.sleep(0.1)
-            self._update_progress(item.id, queue, 0.96, "Writing files...")
-            time.sleep(0.1)
 
             # Success
             output_paths = ", ".join([str(p) for p in outputs])
@@ -201,8 +161,7 @@ class BatchProcessor:
             logging.info(f"Completed {item.filename}")
 
         except Exception as e:
-            # Failure - stop progress monitor
-            done["value"] = True
+            # Failure
             error_msg = str(e)
             queue.update_status(item.id, "failed", 0.0, "Failed", error_msg)
             self.progress_callback(item.id, "failed", 0.0, error_msg)
@@ -210,6 +169,4 @@ class BatchProcessor:
             raise
 
         finally:
-            # Ensure monitor thread is stopped
-            done["value"] = True
             self._current_item_id = None

@@ -66,6 +66,21 @@ class DaylogGUI:
 
         self.setup_ui()
         self.bind_events()
+        
+        # Check dependencies
+        self.root.after(100, self._check_dependencies)
+
+    def _check_dependencies(self) -> None:
+        """Check for external dependencies like FFmpeg."""
+        import shutil
+        if not shutil.which("ffmpeg"):
+            from tkinter import messagebox
+            messagebox.showwarning(
+                "Missing Dependency",
+                "FFmpeg was not found on your system.\n\n"
+                "Audio conversion and processing will likely fail.\n"
+                "Please install FFmpeg and ensure it is in your PATH."
+            )
 
     def setup_ui(self) -> None:
         """Setup UI components."""
