@@ -40,3 +40,9 @@
 - Why: clarify output structure for users.
 - Risks/known issues: none.
 - Next steps: none.
+
+## 2026-01-10 18:45
+- What changed: rewrote troubleshooting Git/ACL section with proper Swedish encoding and clearer steps.
+- Why: fix mojibake and correct guidance on Windows ACL handling.
+- Risks/known issues: none.
+- Next steps: commit and push when Git permissions are stable.
