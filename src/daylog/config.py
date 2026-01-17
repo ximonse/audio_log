@@ -18,6 +18,7 @@ class VadConfig:
     min_speech_s: float = 0.25  # Minimum speech duration in seconds
     min_silence_s: float = 0.1  # Minimum silence duration to split segments
     padding_pre_s: float = 0.0  # Padding before each segment
+    padding_post_s: float = 0.0  # Padding after each segment
 
 
 @dataclass(frozen=True)

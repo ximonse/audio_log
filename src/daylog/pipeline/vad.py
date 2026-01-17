@@ -226,7 +226,7 @@ def run_vad(wav_path: Path, config: VadConfig) -> List[VadSegment]:
         region_audio = audio[region_start:region_end]
         region_tensor = torch.from_numpy(region_audio)
 
-        # Run Silero VAD
+        # Run Silero VAD (no padding here - we apply pre/post padding manually)
         speech_timestamps = get_speech_timestamps(
             region_tensor,
             model,
@@ -235,13 +235,17 @@ def run_vad(wav_path: Path, config: VadConfig) -> List[VadSegment]:
             min_speech_duration_ms=int(config.min_speech_s * 1000),
             min_silence_duration_ms=int(config.min_silence_s * 1000),
             window_size_samples=512,
-            speech_pad_ms=int(config.padding_pre_s * 1000),
+            speech_pad_ms=0,
         )
 
-        # Convert to absolute timestamps
+        # Convert to absolute timestamps with pre/post padding
+        duration_s = len(audio) / sample_rate
         for ts in speech_timestamps:
-            abs_start = (region_start + ts["start"]) / sample_rate
-            abs_end = (region_start + ts["end"]) / sample_rate
+            abs_start = (region_start + ts["start"]) / sample_rate - config.padding_pre_s
+            abs_end = (region_start + ts["end"]) / sample_rate + config.padding_post_s
+            # Clamp to valid range
+            abs_start = max(0.0, abs_start)
+            abs_end = min(duration_s, abs_end)
             all_segments.append(VadSegment(t0=abs_start, t1=abs_end, vad_confidence=1.0))
 
     total_speech_s = sum(seg.t1 - seg.t0 for seg in all_segments)

@@ -3,10 +3,11 @@
 threshold = 0.5  # Speech probability (0-1). Higher = stricter
 min_speech_s = 0.25  # Minimum speech segment length
 min_silence_s = 2.0  # Minimum silence to split segments (increased for better chunking)
-padding_pre_s = 0.0  # Padding before segments
+padding_pre_s = 0.3  # Padding before segments (captures word beginnings)
+padding_post_s = 0.3  # Padding after segments (captures word endings)
 
 [asr]
-model = "small"  # Options: tiny, base, small, medium, large (small is best for Swedish)
+model = "medium"  # Options: tiny, base, small, medium, large-v3
 language = "sv"  # Force Swedish transcription
 word_timestamps = false
 

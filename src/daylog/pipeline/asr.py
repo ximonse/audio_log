@@ -158,7 +158,7 @@ def transcribe_segments(
                 str(chunk_path),
                 language=config.language,
                 word_timestamps=config.word_timestamps,
-                beam_size=1,  # Faster inference, minimal accuracy loss
+                beam_size=5,  # Better quality (1=fastest, 5=best quality)
                 vad_filter=False,  # We already did VAD
             )
 
